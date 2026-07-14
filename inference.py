@@ -1,3 +1,7 @@
+import time
+
+PROCESS_STARTED_AT = time.perf_counter()
+
 import os, copy, pickle, torch, yaml, random, json, cv2, torchvision, subprocess, argparse, uuid, datetime, tempfile, librosa, face_alignment
 
 import numpy as np
@@ -14,6 +18,19 @@ from tqdm import tqdm
 from pathlib import Path
 from omegaconf import OmegaConf
 from transformers import Wav2Vec2FeatureExtractor
+
+
+def synchronize_cuda():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def print_timing(label, started_at):
+    synchronize_cuda()
+    elapsed = time.perf_counter() - started_at
+    print(f"[Timing] {label}: {elapsed:.3f}s", flush=True)
+    return elapsed
+
 
 class DataProcessor:
     def __init__(self, opt):
@@ -110,18 +127,35 @@ class DataProcessor:
 
 class InferenceAgent:
     def __init__(self, opt) -> None:
+        agent_started_at = time.perf_counter()
         self.opt = opt
         self.rank = opt.rank
 
         self.init_network()
+
+        data_processor_started_at = time.perf_counter()
         self.data_processor = DataProcessor(opt)
+        print_timing("Data processor initialization", data_processor_started_at)
+        print_timing("Total inference-agent startup", agent_started_at)
         
     def init_network(self):
         from models.avatarforcing.AvatarForcing import AvatarForcing
 
-        self.G = AvatarForcing(self.opt).to(self.rank)
-        self.load_mae_ckpt(opt.mae_ckpt_path, rank=self.rank)
-        self.load_ckpt(opt.ckpt_path, rank = self.rank)
+        model_construction_started_at = time.perf_counter()
+        self.G = AvatarForcing(self.opt)
+        print_timing("Model construction", model_construction_started_at)
+
+        gpu_transfer_started_at = time.perf_counter()
+        self.G = self.G.to(self.rank)
+        print_timing("Initial model transfer to GPU", gpu_transfer_started_at)
+
+        mae_started_at = time.perf_counter()
+        self.load_mae_ckpt(self.opt.mae_ckpt_path, rank=self.rank)
+        print_timing("Motion-autoencoder checkpoint loading", mae_started_at)
+
+        model_checkpoint_started_at = time.perf_counter()
+        self.load_ckpt(self.opt.ckpt_path, rank=self.rank)
+        print_timing("AvatarForcing checkpoint loading", model_checkpoint_started_at)
         self.G.eval()
 
     def load_ckpt(self, ckpt_path, rank):
@@ -153,13 +187,17 @@ class InferenceAgent:
         seed: int             = 25
     ) -> None:
 
+        inference_started_at = time.perf_counter()
+        preprocessing_started_at = time.perf_counter()
         data = self.data_processor.preprocess(
                 avatar_ref_path   = avatar_ref_path,
                 avatar_audio_path = avatar_audio_path,
                 user_audio_path   = user_audio_path,
                 user_video_path   = user_video_path
         )
+        print_timing("Inference input preprocessing", preprocessing_started_at)
 
+        generation_started_at = time.perf_counter()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             d_hat = self.G.inference(
                 data          = data,
@@ -169,10 +207,15 @@ class InferenceAgent:
                 seed          = seed,
                 use_kv_cache  = True
             )['d_hat']
+        print_timing("Model generation and decode", generation_started_at)
 
         avatar_name = os.path.basename(avatar_ref_path).split(".")[0]
         res_video_path = os.path.join(self.opt.result_dir, f"{avatar_name}-seed{seed}-{uuid.uuid4().hex[:10]}.mp4")
+
+        video_saving_started_at = time.perf_counter()
         self.save_video(d_hat, res_video_path, avatar_audio_path)
+        print_timing("Video encoding and audio mux", video_saving_started_at)
+        print_timing("Total run_inference", inference_started_at)
 
     def save_video(self, vid_target_recon:torch.Tensor, video_path:str, audio_path:str) -> str:
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete = False) as temp_video:
@@ -263,3 +306,4 @@ if __name__ == '__main__':
 
         nfe               = opt.nfe
     )
+    print_timing("Total process runtime", PROCESS_STARTED_AT)
